@@ -4,11 +4,11 @@ import machine
 import bme280_i2c
 import time
 
-# Create a micropython I2C object with the appropriate device pins
+# Create a Micropython I2C object with the appropriate device pins
 i2c = machine.I2C(scl=machine.Pin(5), sda=machine.Pin(4))
 
 # Create a sensor object to represent the BME280
-# Note that this will error if the device can't be reached over I2C.
+# Note that this will throw error if the device can't be reached over I2C.
 sensor = bme280_i2c.BME280_I2C(address=bme280_i2c.BME280_I2C_ADDR_PRIM, i2c=i2c)
 
 # Configure the sensor for the application in question.
@@ -25,7 +25,7 @@ sensor.set_power_mode(bme280_i2c.BME280_NORMAL_MODE)
 # Wait for the measurement settle time, print the measurement, and repeat
 while 1:
     print( sensor.get_measurement() )
-    time.sleep(10)
+    time.sleep_ms(100)
 
 # The above code repeatedly prints a line like:
 # {'pressure': 101412.0, 'humidity': 39.5, 'temperature': 27.86}
