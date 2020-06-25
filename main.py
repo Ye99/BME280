@@ -24,7 +24,10 @@ sensor.set_power_mode(bme280_i2c.BME280_NORMAL_MODE)
 
 # Wait for the measurement settle time, print the measurement, and repeat
 while 1:
-    print( sensor.get_measurement() )
+    print('Temperature: {}'.format(sensor.get_measurement()["temperature"]))
+    print('Humidity: {}'.format(sensor.get_measurement()["humidity"]))
+    print('Pressure: {}'.format(sensor.get_measurement()["pressure"]))
+    print('========================')
     time.sleep_ms(100)
 
 # The above code repeatedly prints a line like:
