@@ -84,7 +84,7 @@ class BME280_I2C:
 
         # The cheaper BMP280 won't pass this function.
         # It only works with BME280.
-        self._read_chip_id()
+        # self._read_chip_id()
         self._soft_reset()
         self._load_calibration_data()
 
