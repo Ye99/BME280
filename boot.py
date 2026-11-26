@@ -8,8 +8,13 @@ import machine
 import gc
 import os
 
-import webrepl
-webrepl.start()
+# WebREPL gives a password-protected REPL over an unencrypted websocket.
+# Handy on the bench; leave it off on a board that is deployed on a network.
+ENABLE_WEBREPL = False
+
+if ENABLE_WEBREPL:
+    import webrepl
+    webrepl.start()
 
 gc.collect()
 

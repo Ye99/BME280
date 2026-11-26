@@ -4,7 +4,9 @@
 # https://projetsdiy.fr - https://diyprojects.io (dec. 2017)
 
 import machine
-i2c = machine.I2C(scl=machine.Pin(5), sda=machine.Pin(4))
+# Newer firmware wants SoftI2C for a bit-banged bus; old firmware only has I2C.
+i2c_class = getattr(machine, 'SoftI2C', None) or machine.I2C
+i2c = i2c_class(scl=machine.Pin(5), sda=machine.Pin(4))
 
 print('Scan i2c bus...')
 devices = i2c.scan()
