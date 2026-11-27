@@ -12,9 +12,24 @@
 # by Peter Dahlberg et al at:
 # https://github.com/catdog2/mpy_bme280_esp8266
 
-from micropython import const
-from ustruct import unpack, unpack_from
-from utime import sleep_ms
+try:
+    from micropython import const
+except ImportError:  # desktop Python, for host-side tests
+    def const(value):
+        return value
+
+try:
+    from ustruct import unpack, unpack_from
+except ImportError:
+    from struct import unpack, unpack_from
+
+try:
+    from utime import sleep_ms
+except ImportError:
+    from time import sleep as _sleep
+
+    def sleep_ms(ms):
+        _sleep(ms / 1000)
 
 # BME280 default address
 BME280_I2C_ADDR_PRIM = const(0x76)
@@ -50,31 +65,53 @@ BME280_FILTER_COEFF_4 = const(0x02)
 BME280_FILTER_COEFF_8 = const(0x03)
 BME280_FILTER_COEFF_16 = const(0x04)
 
-# BME280 Chip ID
+# Chip IDs. The BMP280 shares the temperature and pressure blocks but has no
+# humidity sensor.
 _BME280_CHIP_ID = const(0x60)
+_BMP280_CHIP_IDS = (0x56, 0x57, 0x58)
 
 # Register Addresses
 _BME280_CHIP_ID_ADDR = const(0xD0)
 _BME280_RESET_ADDR = const(0xE0)
 _BME280_TEMP_PRESS_CALIB_DATA_ADDR = const(0x88)
 _BME280_HUMIDITY_CALIB_DATA_ADDR = const(0xE1)
-_BME280_PWR_CTRL_ADDR = const(0xF4)
 _BME280_CTRL_HUM_ADDR = const(0xF2)
+_BME280_STATUS_ADDR = const(0xF3)
 _BME280_CTRL_MEAS_ADDR = const(0xF4)
+_BME280_PWR_CTRL_ADDR = _BME280_CTRL_MEAS_ADDR  # mode bits live in ctrl_meas
 _BME280_CONFIG_ADDR = const(0xF5)
 _BME280_DATA_ADDR = const(0xF7)
+
+# Status register bits
+_STATUS_MEASURING = const(0x08)
+_STATUS_IM_UPDATE = const(0x01)
 
 # Register range sizes
 _BME280_TEMP_PRESS_CALIB_DATA_LEN = const(26)
 _BME280_HUMIDITY_CALIB_DATA_LEN = const(7)
 _BME280_P_T_H_DATA_LEN = const(8)
 
+# Data register contents when a measurement was skipped, or none has run yet
+# since reset (datasheet section 5.4.7 to 5.4.9).
+_SKIPPED_TP = const(0x80000)
+_SKIPPED_H = const(0x8000)
+
+# Polling limits, in 1 ms steps. The longest conversion (16x on all three
+# channels) takes about 113 ms (datasheet section 9.1).
+_NVM_COPY_TIMEOUT_MS = const(20)
+_MEASUREMENT_TIMEOUT_MS = const(150)
+
+_NO_READING = {"temperature": None, "pressure": None, "humidity": None}
+
 
 class BME280_I2C:
     def __init__(self, address: int = BME280_I2C_ADDR_PRIM, i2c=None):
         """
-        Ensure I2C communication with the sensor is working, reset the sensor,
-        and load its calibration data into memory.
+        Check the chip ID, reset the sensor, and load its calibration data.
+
+        Works with the BME280 and the BMP280; on a BMP280 has_humidity is
+        False and humidity readings are None. Raises OSError if the device
+        at this address is neither.
         """
         self.address = address
 
@@ -82,32 +119,42 @@ class BME280_I2C:
             raise ValueError('A configured I2C object is required.')
         self.i2c = i2c
 
-        # The cheaper BMP280 won't pass this function.
-        # It only works with BME280.
-        # self._read_chip_id()
+        self.chip_id = self._read_chip_id()
+        self.has_humidity = self.chip_id == _BME280_CHIP_ID
         self._soft_reset()
         self._load_calibration_data()
 
-    def _read_chip_id(self):
+    def _read_chip_id(self) -> int:
         """
-        Read the chip ID from the sensor and verify it's correct.
-        If the value isn't correct, wait 1ms and try again.
-        If 5 tries don't work, raise an exception.
+        Read the chip ID and check it belongs to a BME280 or BMP280.
+        If it doesn't, wait 1ms and try again; after 5 tries raise OSError,
+        before anything has been written to the device.
         """
-        for x in range(5):
-            mem = self.i2c.readfrom_mem(self.address, _BME280_CHIP_ID_ADDR, 1)
-            if mem[0] == _BME280_CHIP_ID:
-                return
+        chip_id = None
+        for _ in range(5):
+            chip_id = self.i2c.readfrom_mem(self.address, _BME280_CHIP_ID_ADDR, 1)[0]
+            if chip_id == _BME280_CHIP_ID or chip_id in _BMP280_CHIP_IDS:
+                return chip_id
             sleep_ms(1)
-        raise Exception("Couldn't read BME280 chip ID after 5 attempts.")
+        raise OSError("No BME280/BMP280 at 0x{:02x} (chip ID 0x{:02x})".format(
+            self.address, chip_id))
+
+    def _read_status(self) -> int:
+        return self.i2c.readfrom_mem(self.address, _BME280_STATUS_ADDR, 1)[0]
 
     def _soft_reset(self):
         """
-        Write the reset command to the sensor's reset address.
-        Wait 2ms, per the reference library's example.
+        Write the reset command, then wait until the sensor has copied its
+        calibration from NVM (status im_update clears), as the reference
+        library does.
         """
         self.i2c.writeto_mem(self.address, _BME280_RESET_ADDR, bytearray([0xB6]))
         sleep_ms(2)
+        for _ in range(_NVM_COPY_TIMEOUT_MS):
+            if not self._read_status() & _STATUS_IM_UPDATE:
+                return
+            sleep_ms(1)
+        raise OSError("BME280 NVM copy did not finish after reset")
 
     def _load_calibration_data(self):
         """
@@ -132,13 +179,22 @@ class BME280_I2C:
          _,
          self.cal_dig_H1) = unpack("<HhhHhhhhhhhhBB", tp_cal_mem)
 
+        # Initialize the cal_t_fine carry-over value used during compensation
+        self.cal_t_fine = 0
+
+        if not self.has_humidity:
+            self.cal_dig_H1 = self.cal_dig_H2 = self.cal_dig_H3 = 0
+            self.cal_dig_H4 = self.cal_dig_H5 = self.cal_dig_H6 = 0
+            return
+
         # Load the rest of the humidity calibration data
         hum_cal_mem = self.i2c.readfrom_mem(self.address,
                                             _BME280_HUMIDITY_CALIB_DATA_ADDR,
                                             _BME280_HUMIDITY_CALIB_DATA_LEN)
 
-        self.cal_dig_H2, self.cal_dig_H3 = unpack("<hB", hum_cal_mem)
+        self.cal_dig_H2, self.cal_dig_H3 = unpack_from("<hB", hum_cal_mem)
 
+        # H4 and H5 are signed 12-bit values that share register 0xE5.
         e4_sign = unpack_from("<b", hum_cal_mem, 3)[0]
         self.cal_dig_H4 = (e4_sign << 4) | (hum_cal_mem[4] & 0b00001111)
 
@@ -146,9 +202,6 @@ class BME280_I2C:
         self.cal_dig_H5 = (e6_sign << 4) | (hum_cal_mem[4] >> 4)
 
         self.cal_dig_H6 = unpack_from("<b", hum_cal_mem, 6)[0]
-
-        # Initialize the cal_t_fine carry-over value used during compensation
-        self.cal_t_fine = 0
 
     def get_measurement_settings(self):
         """
@@ -179,11 +232,18 @@ class BME280_I2C:
         standby_time.  All values are optional, and omitting any will retain
         the pre-existing value.
 
+        The sensor is put to sleep while the registers are written (the
+        config register is ignored in normal mode), and normal mode is
+        restored afterwards if it was running.
+
         See the data sheet, section 3 and 5
         """
         self._validate_settings(settings)
-        self._ensure_sensor_is_asleep()
+        was_running = self.get_power_mode() == BME280_NORMAL_MODE
+        self._enter_sleep_mode()
         self._write_measurement_settings(settings)
+        if was_running:
+            self._write_power_mode(BME280_NORMAL_MODE)
 
     def _validate_settings(self, settings: dict):
         oversampling_options = [
@@ -203,18 +263,12 @@ class BME280_I2C:
             BME280_STANDBY_TIME_1000_MS, BME280_STANDBY_TIME_10_MS,
             BME280_STANDBY_TIME_20_MS]
 
-        if 'osr_h' in settings:
-            if settings['osr_h'] not in oversampling_options:
-                raise ValueError("osr_h must be one of the oversampling defines")
-        if 'osr_p' in settings:
-            if settings['osr_h'] not in oversampling_options:
-                raise ValueError("osr_p must be one of the oversampling defines")
-        if 'osr_t' in settings:
-            if settings['osr_h'] not in oversampling_options:
-                raise ValueError("osr_t must be one of the oversampling defines")
+        for key in ('osr_h', 'osr_p', 'osr_t'):
+            if key in settings and settings[key] not in oversampling_options:
+                raise ValueError("{} must be one of the oversampling defines".format(key))
         if 'filter' in settings:
             if settings['filter'] not in filter_options:
-                raise ValueError("filter filter coefficient defines")
+                raise ValueError("filter must be one of the filter coefficient defines")
         if 'standby_time' in settings:
             if settings['standby_time'] not in standby_time_options:
                 raise ValueError("standby_time must be one of the standby time duration defines")
@@ -224,8 +278,8 @@ class BME280_I2C:
         mem = self.i2c.readfrom_mem(self.address, _BME280_CTRL_HUM_ADDR, 4)
         ctrl_hum, _, ctrl_meas, config = unpack("<BBBB", mem)
 
-        # Make any changes necessary to the ctrl_hum register
-        if "osr_h" in settings:
+        # Make any changes necessary to the ctrl_hum register (BME280 only)
+        if "osr_h" in settings and self.has_humidity:
             newval = (ctrl_hum & 0b11111000) | (settings['osr_h'] & 0b00000111)
             self.i2c.writeto_mem(self.address, _BME280_CTRL_HUM_ADDR, bytearray([newval]))
 
@@ -273,53 +327,91 @@ class BME280_I2C:
         if new_power_mode not in [BME280_SLEEP_MODE, BME280_FORCED_MODE, BME280_NORMAL_MODE]:
             raise ValueError("New power mode must be sleep, forced, or normal constant")
 
-        self._ensure_sensor_is_asleep()
+        self._enter_sleep_mode()
+        self._write_power_mode(new_power_mode)
 
+    def _write_power_mode(self, power_mode: int):
         # Read the current register, mask out and set the new power mode,
         # and write the register back to the device.
         mem = self.i2c.readfrom_mem(self.address, _BME280_PWR_CTRL_ADDR, 1)
-        newval = (mem[0] & 0b11111100) | (new_power_mode & 0b00000011)
+        newval = (mem[0] & 0b11111100) | (power_mode & 0b00000011)
         self.i2c.writeto_mem(self.address, _BME280_PWR_CTRL_ADDR, bytearray([newval]))
 
-    def _ensure_sensor_is_asleep(self):
+    def _enter_sleep_mode(self):
         """
-        If the sensor mode isn't already "sleep", then put it to sleep.
+        If the sensor mode isn't already "sleep", put it to sleep by clearing
+        the mode bits in ctrl_meas. Oversampling, filter and standby settings
+        are kept.
 
-        This is done by reading out the configuration values we want to keep,
-        and then doing a soft reset and writing those values back.
+        A mode change sent during a conversion only takes effect when the
+        conversion ends, and control-register writes before then are ignored
+        (datasheet section 3.3), so wait until the sensor is really asleep.
+        Raises OSError if that takes longer than the longest conversion.
         """
-        if self.get_power_mode() != BME280_SLEEP_MODE:
-            settings = self.get_measurement_settings()
-            self._soft_reset()
-            self._write_measurement_settings(settings)
+        if self.get_power_mode() == BME280_SLEEP_MODE:
+            return
+        self._write_power_mode(BME280_SLEEP_MODE)
+        for _ in range(_MEASUREMENT_TIMEOUT_MS):
+            if (not self._read_status() & _STATUS_MEASURING
+                    and self.get_power_mode() == BME280_SLEEP_MODE):
+                return
+            sleep_ms(1)
+        raise OSError("BME280 did not enter sleep mode")
+
+    def _wait_for_measurement(self):
+        """
+        Wait until no conversion is running (status measuring bit clear), so
+        the data registers hold a finished measurement. Raises OSError if a
+        conversion runs longer than the longest one the datasheet allows.
+        """
+        for _ in range(_MEASUREMENT_TIMEOUT_MS):
+            if not self._read_status() & _STATUS_MEASURING:
+                return
+            sleep_ms(1)
+        raise OSError("BME280 measurement did not finish")
 
     def get_measurement(self):
         """
-        Return a set of measurements in decimal value, compensated with the
-        sensor's stored calibration data.
-        """
-        uncompensated_data = self._read_uncompensated_data()
+        Return a dict of temperature (DegC), pressure (Pa) and humidity
+        (%RH), compensated with the sensor's stored calibration data.
 
-        # Be sure to call self._compensate_temperature() first, as it sets a
-        # global "fine" calibration value for the other two compensation
-        # functions
+        Waits for any running conversion to finish first. A value is None
+        when the sensor has no measurement for it: nothing measured yet
+        since reset, that channel's oversampling set to skipped, or no
+        humidity sensor (BMP280). Pressure and humidity need the
+        temperature, so they are None whenever temperature is.
+        """
+        self._wait_for_measurement()
+        raw = self._read_uncompensated_data()
+
+        if raw['temperature'] == _SKIPPED_TP:
+            return dict(_NO_READING)
+
+        # Temperature first: it sets cal_t_fine, used by the other two.
+        temperature = self._compensate_temperature(raw['temperature'])
+
+        pressure = None
+        if raw['pressure'] != _SKIPPED_TP:
+            pressure = self._compensate_pressure(raw['pressure'])
+
+        humidity = None
+        if self.has_humidity and raw['humidity'] != _SKIPPED_H:
+            humidity = self._compensate_humidity(raw['humidity'])
+
         return {
-            "temperature": self._compensate_temperature(uncompensated_data['temperature']),
-            "pressure": self._compensate_pressure(uncompensated_data['pressure']),
-            "humidity": self._compensate_humidity(uncompensated_data['humidity']),
+            "temperature": temperature,
+            "pressure": pressure,
+            "humidity": humidity,
         }
 
     def _read_uncompensated_data(self):
-        # Read the uncompensated temperature, pressure, and humidity data
+        # Read the uncompensated temperature, pressure, and humidity data in
+        # one burst, so all three come from the same measurement.
         mem = self.i2c.readfrom_mem(self.address, _BME280_DATA_ADDR, _BME280_P_T_H_DATA_LEN)
         (press_msb, press_lsb, press_xlsb,
          temp_msb, temp_lsb, temp_xlsb,
          hum_msb, hum_lsb) = unpack("<BBBBBBBB", mem)
 
-        # Assemble the values from the memory fragments and return a dict.
-        #
-        # Note that we're calling temperature first, since it sets the
-        # cal_t_fine value used in humidity and pressure.
         return {
             "temperature": (temp_msb << 12) | (temp_lsb << 4) | (temp_xlsb >> 4),
             "pressure": (press_msb << 12) | (press_lsb << 4) | (press_xlsb >> 4),
@@ -430,20 +522,22 @@ class BME280_I2C:
     #     return humidity
 
     ##
-    # 32-Bit Integer Implementations
+    # Integer Implementations (datasheet section 4.2.3 / 8.1)
+    #
+    # Python integers don't overflow, so these follow the reference C code
+    # without its 32-bit wraparound. Floor division (//) on negative numbers
+    # matches C's arithmetic right shift.
     ##
 
     def _compensate_temperature(self, adc_T: int) -> float:
         """
-        Output value of “25.0” equals 25.0 DegC.
+        Output value of "25.0" equals 25.0 DegC. Not clamped: a value outside
+        the -40..85 DegC operating range is returned as computed.
 
         See the integer implementation in the data sheet, section 4.2.3
         And the reference library:
         https://github.com/BoschSensortec/BME280_driver/blob/bme280_v3.3.4/bme280.c#L987
         """
-        temperature_min = -4000
-        temperature_max = 8500
-
         var1 = (((adc_T // 8) - (self.cal_dig_T1 * 2)) * self.cal_dig_T2) // 2048
 
         var2 = (((((adc_T // 16) - self.cal_dig_T1) * (
@@ -453,76 +547,52 @@ class BME280_I2C:
 
         temperature = (self.cal_t_fine * 5 + 128) // 256
 
-        if temperature < temperature_min:
-            temperature = temperature_min
-        elif temperature > temperature_max:
-            temperature = temperature_max
-
         return temperature / 100
 
-    def _compensate_pressure(self, adc_P: int) -> float:
+    def _compensate_pressure(self, adc_P: int):
         """
-        Output value of “96386.0” equals 96386 Pa = 963.86 hPa
+        Output value of "96386.2" equals 96386.2 Pa = 963.862 hPa, with
+        1/256 Pa resolution. Returns None if the calibration data is invalid
+        (it would divide by zero). Not clamped.
 
-        See the 32-bit integer implementation in the data sheet, section 4.2.3
-        And the reference library:
-        https://github.com/BoschSensortec/BME280_driver/blob/bme280_v3.3.4/bme280.c#L1059
-
-        Note that there's a 64-bit version of this function in the reference
-        library on line 1016 that we're leaving unimplemented.
+        This is the 64-bit integer implementation from the data sheet,
+        section 4.2.3, and the reference library:
+        https://github.com/BoschSensortec/BME280_driver/blob/bme280_v3.3.4/bme280.c#L1016
         """
-        pressure_min = 30000
-        pressure_max = 110000
-
-        var1 = (self.cal_t_fine // 2) - 64000
-
-        var2 = (((var1 // 4) * (var1 // 4)) // 2048) * self.cal_dig_P6
-        var2 = var2 + ((var1 * self.cal_dig_P5) * 2)
-        var2 = (var2 // 4) + (self.cal_dig_P4 * 65536)
-
-        var3 = (self.cal_dig_P3 * (((var1 // 4) * (var1 // 4)) // 8192)) // 8
-
-        var4 = (self.cal_dig_P2 * var1) // 2
-
-        var1 = (var3 + var4) // 262144
-        var1 = ((32768 + var1) * self.cal_dig_P1) // 32768
+        var1 = self.cal_t_fine - 128000
+        var2 = var1 * var1 * self.cal_dig_P6
+        var2 = var2 + ((var1 * self.cal_dig_P5) << 17)
+        var2 = var2 + (self.cal_dig_P4 << 35)
+        var1 = ((var1 * var1 * self.cal_dig_P3) >> 8) + ((var1 * self.cal_dig_P2) << 12)
+        var1 = (((1 << 47) + var1) * self.cal_dig_P1) >> 33
 
         # avoid exception caused by division by zero
-        if var1:
-            var5 = 1048576 - adc_P
+        if var1 == 0:
+            return None
 
-            pressure = (var5 - (var2 // 4096)) * 3125
+        pressure = 1048576 - adc_P
+        numerator = ((pressure << 31) - var2) * 3125
+        # C division truncates toward zero; floor division would not for
+        # negative values.
+        pressure = abs(numerator) // abs(var1)
+        if (numerator < 0) != (var1 < 0):
+            pressure = -pressure
 
-            if pressure < 0x80000000:
-                pressure = (pressure << 1) // var1
-            else:
-                pressure = (pressure // var1) * 2
+        var1 = (self.cal_dig_P9 * (pressure >> 13) * (pressure >> 13)) >> 25
+        var2 = (self.cal_dig_P8 * pressure) >> 19
 
-            var1 = (self.cal_dig_P9 * (((pressure // 8) * (pressure // 8)) // 8192)) // 4096
+        pressure = ((pressure + var1 + var2) >> 8) + (self.cal_dig_P7 << 4)
 
-            var2 = (((pressure // 4)) * self.cal_dig_P8) // 8192
-
-            pressure = pressure + ((var1 + var2 + self.cal_dig_P7) // 16)
-
-            if pressure < pressure_min:
-                pressure = pressure_min
-            elif pressure > pressure_max:
-                pressure = pressure_max
-
-        else:
-            # Invalid case
-            pressure = pressure_min
-
-        return pressure
+        return pressure / 256
 
     def _compensate_humidity(self, adc_H: int) -> float:
         """
         Output value between 0.0 and 100.0, where 100.0 is 100%RH
 
-        See the floating-point implementation in the reference library:
-        https://github.com/BoschSensortec/BME280_driver/blob/bme280_v3.3.4/bme280.c#1108
+        See the 32-bit integer implementation in the data sheet, section 4.2.3
+        And the reference library:
+        https://github.com/BoschSensortec/BME280_driver/blob/bme280_v3.3.4/bme280.c#L1108
         """
-
         humidity_max = 102400
 
         var1 = self.cal_t_fine - 76800
