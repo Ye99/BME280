@@ -342,9 +342,21 @@ class BME280_I2C:
         If the sensor mode isn't already "sleep", put it to sleep by clearing
         the mode bits in ctrl_meas. Oversampling, filter and standby settings
         are kept.
+
+        A mode change sent during a conversion only takes effect when the
+        conversion ends, and control-register writes before then are ignored
+        (datasheet section 3.3), so wait until the sensor is really asleep.
+        Raises OSError if that takes longer than the longest conversion.
         """
-        if self.get_power_mode() != BME280_SLEEP_MODE:
-            self._write_power_mode(BME280_SLEEP_MODE)
+        if self.get_power_mode() == BME280_SLEEP_MODE:
+            return
+        self._write_power_mode(BME280_SLEEP_MODE)
+        for _ in range(_MEASUREMENT_TIMEOUT_MS):
+            if (not self._read_status() & _STATUS_MEASURING
+                    and self.get_power_mode() == BME280_SLEEP_MODE):
+                return
+            sleep_ms(1)
+        raise OSError("BME280 did not enter sleep mode")
 
     def _wait_for_measurement(self):
         """

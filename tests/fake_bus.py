@@ -29,6 +29,7 @@ class FakeBME280:
         self.measuring_pending = 0
         self.measuring_reads = measuring_reads
         self.raw = None  # (adc_T, adc_P, adc_H) produced by the next conversion
+        self.deferred_ctrl_meas = None  # mode change held until conversion ends
         self.set_calibration(tp or EXAMPLE_TP, h or EXAMPLE_H)
         self._load_reset_data()
 
@@ -90,6 +91,9 @@ class FakeBME280:
                 status |= 0x08
                 if not self.measuring_pending:
                     self._convert()
+                    if self.deferred_ctrl_meas is not None:
+                        self.mem[0xF4] = self.deferred_ctrl_meas
+                        self.deferred_ctrl_meas = None
                     if self.mode() in (0x01, 0x02):
                         self.mem[0xF4] &= 0xFC  # forced mode drops back to sleep
             self.mem[0xF3] = status
@@ -106,6 +110,12 @@ class FakeBME280:
                     self.mem[r] = 0
                 self._load_reset_data()
                 self.im_update_pending = self.im_update_reads
+            return
+        if self.measuring_pending and reg in (0xF2, 0xF4, 0xF5):
+            # Datasheet 3.3: a mode change during a conversion is held until
+            # the conversion ends; other control writes meanwhile are ignored.
+            if reg == 0xF4 and self.deferred_ctrl_meas is None:
+                self.deferred_ctrl_meas = buf[0]
             return
         self.mem[reg:reg + len(buf)] = buf
         if reg == 0xF4 and (buf[0] & 0x03) in (0x01, 0x02, 0x03):

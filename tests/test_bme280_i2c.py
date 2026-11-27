@@ -116,6 +116,30 @@ def test_settings_change_sleeps_without_soft_reset_and_writes_config_while_aslee
     assert sleep_at < config_at
 
 
+def test_settings_change_during_a_conversion_is_not_lost():
+    # A sleep command sent mid-conversion only takes effect once the
+    # conversion ends; writes before then are ignored (datasheet 3.3).
+    sensor, bus = make(measuring_reads=3)
+    start_normal(sensor, bus)
+    sensor.set_measurement_settings({"filter": m.BME280_FILTER_COEFF_16})
+    assert sensor.get_measurement_settings()["filter"] == m.BME280_FILTER_COEFF_16
+    assert sensor.get_power_mode() == m.BME280_NORMAL_MODE
+
+
+def test_power_mode_change_during_a_conversion_is_not_lost():
+    sensor, bus = make(measuring_reads=3)
+    start_normal(sensor, bus)
+    sensor.set_power_mode(m.BME280_SLEEP_MODE)
+    assert sensor.get_power_mode() == m.BME280_SLEEP_MODE
+
+
+def test_sleep_transition_times_out_if_conversion_never_ends():
+    sensor, bus = make(measuring_reads=10 ** 9)
+    start_normal(sensor, bus)
+    with pytest.raises(OSError):
+        sensor.set_measurement_settings({"filter": m.BME280_FILTER_COEFF_2})
+
+
 # --- Finding 3: no reading before a measurement exists -------------------------
 
 def test_get_measurement_waits_for_first_conversion_in_normal_mode():
